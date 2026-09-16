@@ -21,9 +21,9 @@ flowchart LR
             MD["mDNS broadcaster"]
             WEB["Embedded Web UI<br/>(embed.FS)"]
         end
-        PM -->|spawns / supervises| AGENT
-        AGENT <-->|stdio: stream-json| AD
-        AD -->|normalized events| SS
+        PM -->|"spawns / supervises"| AGENT
+        AGENT <-->|"stdio: stream-json"| AD
+        AD -->|"normalized events"| SS
         SS --> HUB
         HUB --> WEB
     end
@@ -31,8 +31,8 @@ flowchart LR
     PHONE["Phone — React Native (Expo)<br/>Android first"]
     PCB["PC B — any browser"]
 
-    PHONE <-.->|WSS — LAN direct or Tailscale| HUB
-    PCB <-.->|HTTPS + WSS — LAN direct| HUB
+    PHONE <-.->|"WSS — LAN direct or Tailscale"| HUB
+    PCB <-.->|"HTTPS + WSS — LAN direct"| HUB
 ```
 
 PC A is the single writer and single source of truth. Clients are views + input devices; the agent never runs anywhere else. The daemon owns the agent process, so clients can come and go freely.
@@ -47,13 +47,13 @@ flowchart TB
         H1["PC A — Daemon :7432<br/>mDNS: _harness._tcp.local"]
         B1["PC B — Browser"]
         P1["Phone — Wi-Fi"]
-        B1 -->|discover via mDNS<br/>WSS direct| H1
-        P1 -->|QR scan or mDNS<br/>WSS direct| H1
+        B1 -->|"discover via mDNS<br/>WSS direct"| H1
+        P1 -->|"QR scan or mDNS<br/>WSS direct"| H1
     end
     subgraph AWAY["Different network (cellular)"]
         P2["Phone — 4G/5G"]
         H2["PC A — Daemon (tailnet IP)"]
-        P2 <-->|WireGuard tunnel<br/>(Tailscale free tier)| H2
+        P2 <-->|"WireGuard tunnel<br/>(Tailscale free tier)"| H2
     end
 ```
 
