@@ -1,0 +1,22 @@
+# Binaries
+/harness
+/harness.exe
+
+# Go
+vendor/
+*.test
+*.out
+coverage.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Local dev data / config (do not commit)
+*.local.json
+/data/
+/config/

@@ -2,7 +2,7 @@
 
 **A multi-device harness for live coding-agent sessions.** Run Claude Code (later OpenAI Codex) on your Windows PC, walk away, and keep driving that *same live session* from another PC or your phone.
 
-> **Status:** Planning complete — pre-implementation. See [PLAN.md](PLAN.md) for the roadmap and POC gates.
+> **Status:** Phase 1 host core implemented. Real Claude POC-1 gate runs when `ANTHROPIC_API_KEY` is set. See [PLAN.md](PLAN.md) for the roadmap.
 
 ---
 
@@ -74,9 +74,43 @@ This product is, by design, a remote-control bridge to a coding agent — pairin
 MSclaudeConnector/
 ├── README.md                ← you are here
 ├── PLAN.md                  ← execution plan & roadmap
-└── docs/
-    ├── ARCHITECTURE.md      ← architecture & tradeoffs
-    └── SYSTEM-DESIGN.md     ← mermaid system diagrams
+├── docs/
+│   ├── ARCHITECTURE.md      ← architecture & tradeoffs
+│   └── SYSTEM-DESIGN.md     ← mermaid system diagrams
+├── cmd/harness              ← daemon CLI entrypoint
+├── internal/
+│   ├── agent/               ← AgentAdapter interface
+│   │   ├── claude/          ← Claude Code stream-json adapter
+│   │   └── mock/            ← deterministic adapter for tests
+│   ├── auth/                ← pairing tokens + device credentials
+│   ├── certutil/            ← self-signed TLS cert generation
+│   ├── config/              ← daemon configuration
+│   ├── discovery/           ← mDNS broadcaster
+│   ├── hub/                 ← WSS sync hub
+│   ├── logger/              ← structured logging
+│   ├── netutil/             ← LAN IP discovery
+│   ├── protocol/            ← versioned JSON message types
+│   ├── store/               ← SQLite event log + device registry
+│   ├── supervisor/          ← process supervisor (Windows Job Objects)
+│   └── webui/               ← embedded placeholder web UI
+└── go.mod / go.sum
 ```
 
-Source code lands after Phase 0 POCs (`/cmd`, `/internal`, `/clients` — layout TBD in implementation planning).
+## Quick Start (development)
+
+```bash
+# Build
+go build -o harness ./cmd/harness
+
+# Run with the mock agent (no Claude binary needed)
+./harness serve --agent mock --dir /path/to/project --bind 127.0.0.1
+
+# Pair a device
+./harness pair --generate              # on the host, prints a token
+./harness pair --approve <token>:phone # physically confirm
+
+# Run with real Claude (requires ANTHROPIC_API_KEY)
+./harness serve --agent claude --dir /path/to/project
+```
+
+The daemon prints a QR code and JSON blob containing addresses, port, token, and certificate fingerprint. Clients connect to `wss://<host>:<port>/ws` with the pinned cert and present the token once.
