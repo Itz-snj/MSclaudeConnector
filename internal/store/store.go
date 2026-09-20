@@ -43,8 +43,10 @@ type Device struct {
 type Snapshot struct {
 	SessionID          string
 	Status             string
+	Mode               string
 	LastSeq            int64
 	PendingPermissions []protocol.PermissionView
+	PendingQuestions   []protocol.QuestionView
 }
 
 // Open opens (and creates) the SQLite database at dbPath.
@@ -153,7 +155,9 @@ func (s *Store) ListSessions() ([]*Session, error) {
 	return out, rows.Err()
 }
 
-func scanSession(s interface{ Scan(dest ...interface{}) error }) (*Session, error) {
+func scanSession(s interface {
+	Scan(dest ...interface{}) error
+}) (*Session, error) {
 	var sess Session
 	var created int64
 	err := s.Scan(&sess.ID, &sess.AgentType, &sess.WorkingDir, &sess.Status, &sess.LastSeq, &created)
@@ -267,8 +271,10 @@ func (s *Store) GetSnapshot(sessionID string) (*Snapshot, error) {
 		Status:             sess.Status,
 		LastSeq:            sess.LastSeq,
 		PendingPermissions: []protocol.PermissionView{},
+		PendingQuestions:   []protocol.QuestionView{},
 	}
 	pending := map[string]protocol.PermissionView{}
+	pendingQ := map[string]protocol.QuestionView{}
 
 	for _, ev := range events {
 		snap.LastSeq = ev.Seq
@@ -277,6 +283,10 @@ func (s *Store) GetSnapshot(sessionID string) (*Snapshot, error) {
 			var body protocol.StatusChangeBody
 			_ = json.Unmarshal(ev.Payload, &body)
 			snap.Status = body.Status
+		case protocol.EventModeChanged:
+			var body protocol.ModeChangedBody
+			_ = json.Unmarshal(ev.Payload, &body)
+			snap.Mode = body.Mode
 		case protocol.EventPermissionRequest:
 			var body protocol.PermissionRequestBody
 			_ = json.Unmarshal(ev.Payload, &body)
@@ -289,11 +299,25 @@ func (s *Store) GetSnapshot(sessionID string) (*Snapshot, error) {
 			var body protocol.PermissionResolvedBody
 			_ = json.Unmarshal(ev.Payload, &body)
 			delete(pending, body.RequestID)
+		case protocol.EventQuestion:
+			var body protocol.QuestionBody
+			_ = json.Unmarshal(ev.Payload, &body)
+			pendingQ[body.QuestionID] = protocol.QuestionView{
+				QuestionID: body.QuestionID,
+				Text:       body.Text,
+			}
+		case protocol.EventQuestionResolved:
+			var body protocol.QuestionResolvedBody
+			_ = json.Unmarshal(ev.Payload, &body)
+			delete(pendingQ, body.QuestionID)
 		}
 	}
 
 	for _, v := range pending {
 		snap.PendingPermissions = append(snap.PendingPermissions, v)
+	}
+	for _, v := range pendingQ {
+		snap.PendingQuestions = append(snap.PendingQuestions, v)
 	}
 	return snap, nil
 }
@@ -367,7 +391,9 @@ func (s *Store) UpdateDeviceLastSeen(deviceID string) error {
 	return err
 }
 
-func scanDevice(s interface{ Scan(dest ...interface{}) error }) (*Device, error) {
+func scanDevice(s interface {
+	Scan(dest ...interface{}) error
+}) (*Device, error) {
 	var d Device
 	var paired, lastSeen sql.NullInt64
 	var revoked int
@@ -453,7 +479,9 @@ func (s *Store) ConsumePendingToken(token string) (*PendingToken, error) {
 	return pt, tx.Commit()
 }
 
-func scanPendingToken(s interface{ Scan(dest ...interface{}) error }) (*PendingToken, error) {
+func scanPendingToken(s interface {
+	Scan(dest ...interface{}) error
+}) (*PendingToken, error) {
 	var pt PendingToken
 	var expires int64
 	var approved int

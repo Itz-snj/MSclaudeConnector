@@ -77,6 +77,7 @@ func (a *Adapter) Stop() error {
 func (a *Adapter) loop(ctx context.Context) {
 	defer a.wg.Done()
 	pendingPermission := ""
+	pendingQuestion := ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -92,10 +93,14 @@ func (a *Adapter) loop(ctx context.Context) {
 				a.emit(protocol.EventPayload{Kind: protocol.EventUserPrompt, Payload: payload(protocol.UserPromptBody{Text: body.Text, ByDevice: "mock"})})
 				a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "running"})})
 				a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: "Ack: " + body.Text + "\n"})})
-				if body.Text == "perm" {
+				switch body.Text {
+				case "perm":
 					pendingPermission = "r-mock-1"
 					a.emit(protocol.EventPayload{Kind: protocol.EventPermissionRequest, Payload: payload(protocol.PermissionRequestBody{RequestID: pendingPermission, Kind: "bash", Summary: "git push"})})
-				} else {
+				case "question":
+					pendingQuestion = "q-mock-1"
+					a.emit(protocol.EventPayload{Kind: protocol.EventQuestion, Payload: payload(protocol.QuestionBody{QuestionID: pendingQuestion, Text: "Which branch?"})})
+				default:
 					a.emit(protocol.EventPayload{Kind: protocol.EventTurnComplete, Payload: payload(struct{}{})})
 					a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "idle"})})
 				}
@@ -108,6 +113,17 @@ func (a *Adapter) loop(ctx context.Context) {
 				pendingPermission = ""
 				a.emit(protocol.EventPayload{Kind: protocol.EventTurnComplete, Payload: payload(struct{}{})})
 				a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "idle"})})
+			case protocol.CmdAnswerQuestion:
+				body, ok := cmd.Payload.(protocol.AnswerQuestionBody)
+				if !ok || body.QuestionID != pendingQuestion || pendingQuestion == "" {
+					continue
+				}
+				// The hub owns the question_resolved event; the adapter just continues.
+				pendingQuestion = ""
+				a.emit(protocol.EventPayload{Kind: protocol.EventTurnComplete, Payload: payload(struct{}{})})
+				a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "idle"})})
+			case protocol.CmdSetMode:
+				// The hub owns the mode_changed event; nothing further to simulate.
 			case protocol.CmdInterrupt:
 				a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "idle"})})
 			}

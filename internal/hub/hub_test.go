@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/Itz-snj/MSclaudeConnector/internal/agent"
 	"github.com/Itz-snj/MSclaudeConnector/internal/agent/mock"
 	"github.com/Itz-snj/MSclaudeConnector/internal/auth"
 	"github.com/Itz-snj/MSclaudeConnector/internal/logger"
 	"github.com/Itz-snj/MSclaudeConnector/internal/protocol"
 	"github.com/Itz-snj/MSclaudeConnector/internal/store"
+	"github.com/coder/websocket"
 )
 
 func newTestStore(t *testing.T) *store.Store {
@@ -107,6 +107,80 @@ func TestHubPairPromptPermissionResume(t *testing.T) {
 	ev = mustReadEvent(t, ctx, conn2, protocol.EventUserPrompt)
 	if ev.Seq != 1 {
 		t.Fatalf("expected resumed event seq 1, got %d", ev.Seq)
+	}
+}
+
+func TestHubQuestionAndSetMode(t *testing.T) {
+	_, authz, _, cancel, wsURL := setupHub(t)
+	defer cancel()
+	ctx, timeout := context.WithTimeout(context.Background(), 30*time.Second)
+	defer timeout()
+
+	token, err := authz.GeneratePairingToken()
+	if err != nil {
+		t.Fatalf("generate token: %v", err)
+	}
+	if err := authz.ApprovePairingToken(token, "phone"); err != nil {
+		t.Fatalf("approve token: %v", err)
+	}
+	cred, deviceID := pair(t, ctx, wsURL, token)
+
+	conn := dialAuth(t, ctx, wsURL, cred)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	sendHello(t, ctx, conn, deviceID, 0)
+	_ = readSnapshot(t, ctx, conn)
+
+	sendCommand(t, ctx, conn, "c1", protocol.CmdSendPrompt, protocol.SendPromptBody{Text: "question"})
+	readAck(t, ctx, conn, "c1")
+	mustReadEvent(t, ctx, conn, protocol.EventUserPrompt)
+	mustReadEvent(t, ctx, conn, protocol.EventStatusChange)
+	mustReadEvent(t, ctx, conn, protocol.EventTextDelta)
+	ev := mustReadEvent(t, ctx, conn, protocol.EventQuestion)
+	var qBody protocol.QuestionBody
+	_ = json.Unmarshal(ev.Payload, &qBody)
+	if qBody.QuestionID == "" {
+		t.Fatal("expected question id")
+	}
+
+	sendCommand(t, ctx, conn, "c2", protocol.CmdAnswerQuestion, protocol.AnswerQuestionBody{QuestionID: qBody.QuestionID, Text: "main"})
+	readAck(t, ctx, conn, "c2")
+	ev = mustReadEvent(t, ctx, conn, protocol.EventQuestionResolved)
+	var qrBody protocol.QuestionResolvedBody
+	_ = json.Unmarshal(ev.Payload, &qrBody)
+	if qrBody.ByDevice != deviceID || qrBody.Text != "main" {
+		t.Fatalf("unexpected question_resolved body %+v", qrBody)
+	}
+	mustReadEvent(t, ctx, conn, protocol.EventTurnComplete)
+	mustReadEvent(t, ctx, conn, protocol.EventStatusChange)
+
+	// A second answer to the same (now resolved) question must be rejected.
+	sendCommand(t, ctx, conn, "c3", protocol.CmdAnswerQuestion, protocol.AnswerQuestionBody{QuestionID: qBody.QuestionID, Text: "again"})
+	for {
+		errEnv := readEnvelope(t, ctx, conn)
+		if errEnv.Type == protocol.MsgError && errEnv.Error != nil && errEnv.Error.Code == "already_resolved" {
+			break
+		}
+	}
+
+	sendCommand(t, ctx, conn, "c4", protocol.CmdSetMode, protocol.SetModeBody{Mode: "plan"})
+	readAck(t, ctx, conn, "c4")
+	ev = mustReadEvent(t, ctx, conn, protocol.EventModeChanged)
+	var mBody protocol.ModeChangedBody
+	_ = json.Unmarshal(ev.Payload, &mBody)
+	if mBody.Mode != "plan" || mBody.ByDevice != deviceID {
+		t.Fatalf("unexpected mode_changed body %+v", mBody)
+	}
+
+	// A fresh connection should see the resolved mode and no pending question.
+	conn2 := dialAuth(t, ctx, wsURL, cred)
+	defer conn2.Close(websocket.StatusNormalClosure, "")
+	sendHello(t, ctx, conn2, deviceID, 0)
+	snap := readSnapshot(t, ctx, conn2)
+	if snap.Mode != "plan" {
+		t.Fatalf("expected mode plan on reconnect, got %s", snap.Mode)
+	}
+	if len(snap.PendingQuestions) != 0 {
+		t.Fatalf("expected no pending questions on reconnect, got %+v", snap.PendingQuestions)
 	}
 }
 

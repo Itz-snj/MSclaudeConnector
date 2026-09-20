@@ -89,6 +89,47 @@ func TestAppendEventAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestAppendEventAndSnapshotQuestionAndMode(t *testing.T) {
+	s := newTestStore(t)
+	sess, err := s.CreateSession("claude", "/tmp/project")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	_, err = s.AppendEvent(sess.ID, protocol.EventQuestion, protocol.QuestionBody{QuestionID: "q1", Text: "Which branch?"})
+	if err != nil {
+		t.Fatalf("append question: %v", err)
+	}
+	_, err = s.AppendEvent(sess.ID, protocol.EventModeChanged, protocol.ModeChangedBody{Mode: "plan", ByDevice: "phone"})
+	if err != nil {
+		t.Fatalf("append mode_changed: %v", err)
+	}
+
+	snap, err := s.GetSnapshot(sess.ID)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap.Mode != "plan" {
+		t.Fatalf("expected mode plan, got %s", snap.Mode)
+	}
+	if len(snap.PendingQuestions) != 1 || snap.PendingQuestions[0].QuestionID != "q1" {
+		t.Fatalf("expected one pending question q1, got %+v", snap.PendingQuestions)
+	}
+
+	_, err = s.AppendEvent(sess.ID, protocol.EventQuestionResolved, protocol.QuestionResolvedBody{QuestionID: "q1", Text: "main", ByDevice: "pc-b"})
+	if err != nil {
+		t.Fatalf("append question resolved: %v", err)
+	}
+
+	snap, err = s.GetSnapshot(sess.ID)
+	if err != nil {
+		t.Fatalf("snapshot after resolve: %v", err)
+	}
+	if len(snap.PendingQuestions) != 0 {
+		t.Fatalf("expected no pending questions, got %+v", snap.PendingQuestions)
+	}
+}
+
 func TestEventsSince(t *testing.T) {
 	s := newTestStore(t)
 	sess, err := s.CreateSession("claude", "/tmp/project")

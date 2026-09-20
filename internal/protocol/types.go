@@ -42,11 +42,13 @@ type HelloPayload struct {
 }
 
 type SnapshotPayload struct {
-	SessionID         string            `json:"sessionId"`
-	Status            string            `json:"status"`
-	LastSeq           int64             `json:"lastSeq"`
+	SessionID          string           `json:"sessionId"`
+	Status             string           `json:"status"`
+	Mode               string           `json:"mode,omitempty"`
+	LastSeq            int64            `json:"lastSeq"`
 	PendingPermissions []PermissionView `json:"pendingPermissions,omitempty"`
-	RecentEvents      []EventPayload   `json:"recentEvents,omitempty"` // optional: last N for context
+	PendingQuestions   []QuestionView   `json:"pendingQuestions,omitempty"`
+	RecentEvents       []EventPayload   `json:"recentEvents,omitempty"` // optional: last N for context
 }
 
 type PermissionView struct {
@@ -55,21 +57,28 @@ type PermissionView struct {
 	Summary   string `json:"summary"`
 }
 
+type QuestionView struct {
+	QuestionID string `json:"questionId"`
+	Text       string `json:"text"`
+}
+
 // EventKind values are produced by the AgentAdapter and stored in the event log.
 type EventKind string
 
 const (
-	EventTextDelta         EventKind = "text_delta"
-	EventToolCallStart     EventKind = "tool_call_start"
-	EventToolCallEnd       EventKind = "tool_call_end"
-	EventPermissionRequest EventKind = "permission_request"
-	EventQuestion          EventKind = "question"
+	EventTextDelta          EventKind = "text_delta"
+	EventToolCallStart      EventKind = "tool_call_start"
+	EventToolCallEnd        EventKind = "tool_call_end"
+	EventPermissionRequest  EventKind = "permission_request"
+	EventQuestion           EventKind = "question"
 	EventPermissionResolved EventKind = "permission_resolved"
-	EventTurnComplete      EventKind = "turn_complete"
-	EventStatusChange      EventKind = "status_change"
-	EventUsageUpdate       EventKind = "usage_update"
-	EventError             EventKind = "error"
-	EventUserPrompt        EventKind = "user_prompt"
+	EventQuestionResolved   EventKind = "question_resolved"
+	EventModeChanged        EventKind = "mode_changed"
+	EventTurnComplete       EventKind = "turn_complete"
+	EventStatusChange       EventKind = "status_change"
+	EventUsageUpdate        EventKind = "usage_update"
+	EventError              EventKind = "error"
+	EventUserPrompt         EventKind = "user_prompt"
 )
 
 type EventPayload struct {
@@ -121,14 +130,18 @@ type SendPromptBody struct {
 }
 
 type AnswerPermissionBody struct {
-	RequestID string `json:"requestId"`
-	Allow     bool   `json:"allow"`
-	AllowAlways bool `json:"allowAlways,omitempty"`
+	RequestID   string `json:"requestId"`
+	Allow       bool   `json:"allow"`
+	AllowAlways bool   `json:"allowAlways,omitempty"`
 }
 
 type AnswerQuestionBody struct {
 	QuestionID string `json:"questionId"`
 	Text       string `json:"text"`
+}
+
+type SetModeBody struct {
+	Mode string `json:"mode"` // e.g. "default", "acceptEdits", "bypassPermissions", "plan"
 }
 
 // --- Event payload bodies ---
@@ -138,9 +151,9 @@ type TextDeltaBody struct {
 }
 
 type ToolCallBody struct {
-	Name      string `json:"name"`
-	Input     string `json:"input,omitempty"`
-	Output    string `json:"output,omitempty"`
+	Name   string `json:"name"`
+	Input  string `json:"input,omitempty"`
+	Output string `json:"output,omitempty"`
 }
 
 type PermissionRequestBody struct {
@@ -158,6 +171,17 @@ type PermissionResolvedBody struct {
 	RequestID string `json:"requestId"`
 	Allow     bool   `json:"allow"`
 	ByDevice  string `json:"byDevice"`
+}
+
+type QuestionResolvedBody struct {
+	QuestionID string `json:"questionId"`
+	Text       string `json:"text"`
+	ByDevice   string `json:"byDevice"`
+}
+
+type ModeChangedBody struct {
+	Mode     string `json:"mode"`
+	ByDevice string `json:"byDevice"`
 }
 
 type StatusChangeBody struct {

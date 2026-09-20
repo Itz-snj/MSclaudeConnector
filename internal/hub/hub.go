@@ -10,12 +10,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/coder/websocket"
 	"github.com/Itz-snj/MSclaudeConnector/internal/agent"
 	"github.com/Itz-snj/MSclaudeConnector/internal/auth"
 	"github.com/Itz-snj/MSclaudeConnector/internal/logger"
 	"github.com/Itz-snj/MSclaudeConnector/internal/protocol"
 	"github.com/Itz-snj/MSclaudeConnector/internal/store"
+	"github.com/coder/websocket"
 )
 
 // Config holds hub-scoped runtime configuration.
@@ -32,10 +32,11 @@ type Hub struct {
 	auth    *auth.Auth
 	adapter agent.Adapter
 
-	mu          sync.RWMutex
-	clients     map[*client]struct{}
-	pending     map[string]protocol.PermissionView // requestId -> view
-	idempotency map[string]struct{}                // deviceID:idempotencyKey
+	mu               sync.RWMutex
+	clients          map[*client]struct{}
+	pending          map[string]protocol.PermissionView // requestId -> view
+	pendingQuestions map[string]protocol.QuestionView   // questionId -> view
+	idempotency      map[string]struct{}                // deviceID:idempotencyKey
 }
 
 type client struct {
@@ -48,14 +49,15 @@ type client struct {
 
 func New(cfg Config, log logger.Logger, st *store.Store, authz *auth.Auth, adapter agent.Adapter) *Hub {
 	return &Hub{
-		cfg:         cfg,
-		log:         log,
-		store:       st,
-		auth:        authz,
-		adapter:     adapter,
-		clients:     map[*client]struct{}{},
-		pending:     map[string]protocol.PermissionView{},
-		idempotency: map[string]struct{}{},
+		cfg:              cfg,
+		log:              log,
+		store:            st,
+		auth:             authz,
+		adapter:          adapter,
+		clients:          map[*client]struct{}{},
+		pending:          map[string]protocol.PermissionView{},
+		pendingQuestions: map[string]protocol.QuestionView{},
+		idempotency:      map[string]struct{}{},
 	}
 }
 
@@ -299,6 +301,59 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 			return
 		}
 
+	case protocol.CmdAnswerQuestion:
+		var body protocol.AnswerQuestionBody
+		if err := json.Unmarshal(cmd.Payload, &body); err != nil {
+			_ = h.clientError(c, cmd.ID, "bad_request", "invalid answer_question payload")
+			return
+		}
+		h.mu.Lock()
+		_, pending := h.pendingQuestions[body.QuestionID]
+		if pending {
+			delete(h.pendingQuestions, body.QuestionID)
+		}
+		h.mu.Unlock()
+		if !pending {
+			_ = h.clientError(c, cmd.ID, "already_resolved", "question already resolved or unknown")
+			return
+		}
+		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventQuestionResolved, protocol.QuestionResolvedBody{
+			QuestionID: body.QuestionID,
+			Text:       body.Text,
+			ByDevice:   c.deviceID,
+		})
+		if err != nil {
+			_ = h.clientError(c, cmd.ID, "server_error", err.Error())
+			return
+		}
+		_ = h.clientAck(c, cmd.ID, ev.Seq)
+		h.broadcast(ev)
+		if err := h.adapter.Command(agent.Command{Kind: protocol.CmdAnswerQuestion, Payload: body}); err != nil {
+			_ = h.clientError(c, cmd.ID, "agent_error", err.Error())
+			return
+		}
+
+	case protocol.CmdSetMode:
+		var body protocol.SetModeBody
+		if err := json.Unmarshal(cmd.Payload, &body); err != nil || body.Mode == "" {
+			_ = h.clientError(c, cmd.ID, "bad_request", "invalid set_mode payload")
+			return
+		}
+		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventModeChanged, protocol.ModeChangedBody{
+			Mode:     body.Mode,
+			ByDevice: c.deviceID,
+		})
+		if err != nil {
+			_ = h.clientError(c, cmd.ID, "server_error", err.Error())
+			return
+		}
+		_ = h.clientAck(c, cmd.ID, ev.Seq)
+		h.broadcast(ev)
+		if err := h.adapter.Command(agent.Command{Kind: protocol.CmdSetMode, Payload: body}); err != nil {
+			_ = h.clientError(c, cmd.ID, "agent_error", err.Error())
+			return
+		}
+
 	case protocol.CmdInterrupt:
 		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventStatusChange, protocol.StatusChangeBody{Status: "idle"})
 		if err != nil {
@@ -342,6 +397,15 @@ func (h *Hub) ingestAdapterEvents(ctx context.Context) {
 				}
 				h.mu.Unlock()
 			}
+			if stored.Kind == protocol.EventQuestion {
+				body := questionBodyFromEvent(stored)
+				h.mu.Lock()
+				h.pendingQuestions[body.QuestionID] = protocol.QuestionView{
+					QuestionID: body.QuestionID,
+					Text:       body.Text,
+				}
+				h.mu.Unlock()
+			}
 			h.broadcast(stored)
 		}
 	}
@@ -349,6 +413,12 @@ func (h *Hub) ingestAdapterEvents(ctx context.Context) {
 
 func permissionBodyFromEvent(ev *protocol.EventPayload) protocol.PermissionRequestBody {
 	var body protocol.PermissionRequestBody
+	_ = json.Unmarshal(ev.Payload, &body)
+	return body
+}
+
+func questionBodyFromEvent(ev *protocol.EventPayload) protocol.QuestionBody {
+	var body protocol.QuestionBody
 	_ = json.Unmarshal(ev.Payload, &body)
 	return body
 }
@@ -464,8 +534,10 @@ func snapshotToPayload(s *store.Snapshot) *protocol.SnapshotPayload {
 	return &protocol.SnapshotPayload{
 		SessionID:          s.SessionID,
 		Status:             s.Status,
+		Mode:               s.Mode,
 		LastSeq:            s.LastSeq,
 		PendingPermissions: s.PendingPermissions,
+		PendingQuestions:   s.PendingQuestions,
 	}
 }
 

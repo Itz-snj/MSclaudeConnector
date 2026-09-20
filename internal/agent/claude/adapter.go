@@ -17,25 +17,30 @@ import (
 )
 
 // Adapter drives Claude Code's stream-json headless mode over stdio.
-// This is intentionally a working skeleton for M2/M3/M4; the exact
-// stream-json schema will be validated and tightened during POC-1 (M5).
 type Adapter struct {
 	log        logger.Logger
 	supervisor *supervisor.Supervisor
 	events     chan protocol.EventPayload
 
-	mu     sync.Mutex
-	proc   *supervisor.ManagedProcess
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	mu        sync.Mutex
+	proc      *supervisor.ManagedProcess
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	sessionID string
 }
 
 func New(log logger.Logger) *Adapter {
 	return &Adapter{
 		log:        log,
 		supervisor: supervisor.New(log),
-		events:     make(chan protocol.EventPayload, 64),
+		events:     make(chan protocol.EventPayload, 256),
 	}
+}
+
+func (a *Adapter) SessionID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessionID
 }
 
 func (a *Adapter) Start(cfg agent.SessionConfig) error {
@@ -45,7 +50,14 @@ func (a *Adapter) Start(cfg agent.SessionConfig) error {
 		return errors.New("claude adapter already started")
 	}
 
-	args := []string{"-p", "--output-format", "stream-json", "--input-format", "stream-json"}
+	// --verbose is required by Claude Code for --output-format=stream-json.
+	args := []string{
+		"-p",
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--replay-user-messages",
+	}
 	if cfg.ResumeSessionID != "" {
 		args = append(args, "--resume", cfg.ResumeSessionID)
 	}
@@ -86,8 +98,7 @@ func (a *Adapter) Command(cmd agent.Command) error {
 		return errors.New("adapter not started")
 	}
 
-	// TODO(M5): map to exact stream-json input schema during POC-1.
-	var msg map[string]interface{}
+	var msg interface{}
 	switch cmd.Kind {
 	case protocol.CmdSendPrompt:
 		body, ok := cmd.Payload.(protocol.SendPromptBody)
@@ -95,21 +106,58 @@ func (a *Adapter) Command(cmd agent.Command) error {
 			return errors.New("invalid send_prompt payload")
 		}
 		msg = map[string]interface{}{
-			"type":    "user_message",
-			"content": body.Text,
+			"type": "user",
+			"message": map[string]interface{}{
+				"role":    "user",
+				"content": body.Text,
+			},
 		}
 	case protocol.CmdAnswerPermission:
 		body, ok := cmd.Payload.(protocol.AnswerPermissionBody)
 		if !ok {
 			return errors.New("invalid answer_permission payload")
 		}
+		behavior := "deny"
+		if body.Allow {
+			behavior = "allow"
+		}
 		msg = map[string]interface{}{
-			"type":       "permission_response",
-			"request_id": body.RequestID,
-			"allow":      body.Allow,
+			"type": "control_response",
+			"response": map[string]interface{}{
+				"subtype":    "success",
+				"request_id": body.RequestID,
+				"response": map[string]interface{}{
+					"behavior":     behavior,
+					"allow_always": body.AllowAlways,
+				},
+			},
 		}
 	case protocol.CmdInterrupt:
-		msg = map[string]interface{}{"type": "interrupt"}
+		msg = map[string]interface{}{
+			"type": "control_request",
+			"request": map[string]interface{}{
+				"subtype": "interrupt",
+			},
+		}
+	case protocol.CmdSetMode:
+		body, ok := cmd.Payload.(protocol.SetModeBody)
+		if !ok {
+			return errors.New("invalid set_mode payload")
+		}
+		// Maps to claude's --permission-mode values: default | acceptEdits |
+		// bypassPermissions | plan. Unverified until POC-1 exercises it live.
+		msg = map[string]interface{}{
+			"type": "control_request",
+			"request": map[string]interface{}{
+				"subtype": "set_permission_mode",
+				"mode":    body.Mode,
+			},
+		}
+	case protocol.CmdAnswerQuestion:
+		// Claude Code's stream-json protocol has no distinct "question" control
+		// message today; mid-turn questions currently surface as permission
+		// requests (can_use_tool). Nothing to forward until that changes.
+		return fmt.Errorf("answer_question has no claude wire equivalent yet")
 	default:
 		return fmt.Errorf("unsupported command kind: %s", cmd.Kind)
 	}
@@ -145,8 +193,7 @@ func (a *Adapter) readStdout(r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		a.handleStreamJSON(line)
+		a.handleStreamJSON(scanner.Bytes())
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
 		a.log.Error("claude stdout scanner error", "error", err)
@@ -162,7 +209,6 @@ func (a *Adapter) readStderr(r io.Reader) {
 }
 
 func (a *Adapter) handleStreamJSON(line []byte) {
-	// TODO(M5): replace with schema-correct parsing once POC-1 confirms it.
 	var raw map[string]interface{}
 	if err := json.Unmarshal(line, &raw); err != nil {
 		a.emit(protocol.EventPayload{Kind: protocol.EventError, Payload: payload(map[string]string{"error": err.Error()})})
@@ -171,12 +217,40 @@ func (a *Adapter) handleStreamJSON(line []byte) {
 
 	t, _ := raw["type"].(string)
 	switch t {
+	case "system":
+		subtype, _ := raw["subtype"].(string)
+		if subtype == "init" {
+			if sid, ok := raw["session_id"].(string); ok && sid != "" {
+				a.mu.Lock()
+				a.sessionID = sid
+				a.mu.Unlock()
+			}
+			a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "idle"})})
+		}
+	case "assistant":
+		a.emitTextFromMessage(raw["message"])
+	case "stream_event":
+		a.handlePartialEvent(raw["event"])
+	case "result":
+		if usage, ok := raw["usage"].(map[string]interface{}); ok {
+			inTok, _ := usage["input_tokens"].(float64)
+			outTok, _ := usage["output_tokens"].(float64)
+			a.emit(protocol.EventPayload{Kind: protocol.EventUsageUpdate, Payload: payload(protocol.UsageUpdateBody{InputTokens: int(inTok), OutputTokens: int(outTok)})})
+		}
+		a.emit(protocol.EventPayload{Kind: protocol.EventTurnComplete, Payload: payload(struct{}{})})
+		a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "idle"})})
+	case "control_request":
+		a.handleControlRequest(raw)
+	case "user":
+		// replayed user messages — ignore
 	case "text", "content_block_delta", "message_delta":
 		content, _ := raw["content"].(string)
 		if content == "" {
 			content, _ = raw["delta"].(string)
 		}
-		a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: content})})
+		if content != "" {
+			a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: content})})
+		}
 	case "tool_use":
 		name, _ := raw["name"].(string)
 		a.emit(protocol.EventPayload{Kind: protocol.EventToolCallStart, Payload: payload(protocol.ToolCallBody{Name: name})})
@@ -197,9 +271,83 @@ func (a *Adapter) handleStreamJSON(line []byte) {
 		outTok, _ := raw["output_tokens"].(float64)
 		a.emit(protocol.EventPayload{Kind: protocol.EventUsageUpdate, Payload: payload(protocol.UsageUpdateBody{InputTokens: int(inTok), OutputTokens: int(outTok)})})
 	default:
-		// Forward unknown structured lines as plain text so nothing is lost.
-		a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: string(line) + "\n"})})
+		a.log.Info("unmapped claude stream-json type", "type", t)
 	}
+}
+
+func (a *Adapter) emitTextFromMessage(msg interface{}) {
+	m, ok := msg.(map[string]interface{})
+	if !ok {
+		return
+	}
+	content, ok := m["content"].([]interface{})
+	if !ok {
+		if s, ok := m["content"].(string); ok && s != "" {
+			a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: s})})
+		}
+		return
+	}
+	for _, block := range content {
+		b, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch b["type"] {
+		case "text":
+			text, _ := b["text"].(string)
+			if text != "" {
+				a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: text})})
+			}
+		case "tool_use":
+			name, _ := b["name"].(string)
+			input, _ := json.Marshal(b["input"])
+			a.emit(protocol.EventPayload{Kind: protocol.EventToolCallStart, Payload: payload(protocol.ToolCallBody{Name: name, Input: string(input)})})
+		}
+	}
+}
+
+func (a *Adapter) handlePartialEvent(ev interface{}) {
+	m, ok := ev.(map[string]interface{})
+	if !ok {
+		return
+	}
+	t, _ := m["type"].(string)
+	if t == "content_block_delta" {
+		delta, _ := m["delta"].(map[string]interface{})
+		text, _ := delta["text"].(string)
+		if text != "" {
+			a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: text})})
+		}
+	}
+}
+
+func (a *Adapter) handleControlRequest(raw map[string]interface{}) {
+	rid, _ := raw["request_id"].(string)
+	req, _ := raw["request"].(map[string]interface{})
+	if req == nil {
+		return
+	}
+	subtype, _ := req["subtype"].(string)
+	if subtype != "can_use_tool" {
+		return
+	}
+	name, _ := req["tool_name"].(string)
+	if name == "" {
+		name, _ = req["name"].(string)
+	}
+	summary, _ := req["tool_use_id"].(string)
+	if input, ok := req["input"]; ok {
+		b, _ := json.Marshal(input)
+		summary = string(b)
+	}
+	if rid == "" {
+		rid, _ = req["request_id"].(string)
+	}
+	a.emit(protocol.EventPayload{Kind: protocol.EventPermissionRequest, Payload: payload(protocol.PermissionRequestBody{
+		RequestID: rid,
+		Kind:      name,
+		Summary:   summary,
+	})})
 }
 
 func payload(v interface{}) json.RawMessage {
@@ -218,7 +366,6 @@ func (a *Adapter) emit(ev protocol.EventPayload) {
 	}
 }
 
-// LookPath returns the path to the claude executable, if any.
 func LookPath() (string, error) {
 	return exec.LookPath("claude")
 }
