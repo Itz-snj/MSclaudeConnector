@@ -1,14 +1,12 @@
 module github.com/Itz-snj/MSclaudeConnector
 
-go 1.24
-
-toolchain go1.24.2
+go 1.26.0
 
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/mdp/qrterminal/v3 v3.2.1
-	golang.org/x/sys v0.29.0
+	golang.org/x/sys v0.48.0
 	modernc.org/sqlite v1.33.1
 )
 
