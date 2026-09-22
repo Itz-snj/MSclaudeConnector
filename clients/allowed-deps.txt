@@ -1,0 +1,21 @@
+# Runtime (production) dependencies permitted in shipped client bundles.
+# One package name per line. Dev-only dependencies are not listed here.
+# The `deps` CI job fails the build if a production dependency is missing.
+
+# Shared protocol package (workspace)
+@harness/protocol
+
+# Web UI
+react
+react-dom
+
+# Expo mobile app
+@harness/mobile
+expo
+expo-modules-core
+expo-status-bar
+expo-camera
+expo-secure-store
+react-native
+@react-native-async-storage/async-storage
+react-native-safe-area-context

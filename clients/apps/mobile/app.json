@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Harness",
+    "slug": "harness",
+    "version": "0.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "android": {
+      "package": "dev.harness.mobile",
+      "permissions": ["CAMERA"]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Harness uses the camera to scan the host pairing QR code."
+        }
+      ],
+      "expo-secure-store"
+    ]
+  }
+}

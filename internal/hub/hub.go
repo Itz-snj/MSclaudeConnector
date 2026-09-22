@@ -18,9 +18,41 @@ import (
 	"github.com/coder/websocket"
 )
 
+// clientQueueHighWater is the per-client outbound queue depth. Overflow closes
+// the connection with StatusTryAgainLater so the client reconnects from its
+// last contiguous seq instead of silently losing events. It is a var so tests
+// can exercise overflow with a small queue.
+var clientQueueHighWater = 4096
+
+// AuthService is the subset of *auth.Auth the hub depends on. It is an
+// interface so tests can substitute a counting fake.
+type AuthService interface {
+	ValidateCredential(credential string) (deviceID string, ok bool)
+	PeekPairingToken(token string) (*store.PendingToken, bool)
+	ConsumePairingToken(token string) (name string, ok bool)
+	ApprovePairingToken(token, name string) error
+	IssueCredential(deviceID, name string) (string, error)
+}
+
+// ApprovalRequest describes an inbound pairing attempt awaiting human
+// confirmation on the host console.
+type ApprovalRequest struct {
+	Token      string
+	RemoteAddr string
+	UserAgent  string
+}
+
+// Approver decides whether an inbound pairing attempt is allowed. The host
+// installs a terminal implementation; a nil Approver means only out-of-band
+// approved tokens are accepted.
+type Approver interface {
+	RequestApproval(ctx context.Context, req ApprovalRequest) (name string, ok bool)
+}
+
 // Config holds hub-scoped runtime configuration.
 type Config struct {
 	SessionID string
+	Approver  Approver
 }
 
 // Hub is the WSS sync server: auth, snapshot+tail fan-out, command intake,
@@ -29,7 +61,7 @@ type Hub struct {
 	cfg     Config
 	log     logger.Logger
 	store   *store.Store
-	auth    *auth.Auth
+	auth    AuthService
 	adapter agent.Adapter
 
 	mu               sync.RWMutex
@@ -44,7 +76,11 @@ type client struct {
 	name     string
 	conn     *websocket.Conn
 	send     chan []byte
+	overflow chan struct{}
 	lastSeq  int64
+	log      logger.Logger
+
+	closeOnce sync.Once
 }
 
 func New(cfg Config, log logger.Logger, st *store.Store, authz *auth.Auth, adapter agent.Adapter) *Hub {
@@ -73,21 +109,13 @@ func (h *Hub) Run(ctx context.Context) {
 	}
 	h.mu.Unlock()
 	for _, c := range clients {
-		_ = c.conn.Close(websocket.StatusGoingAway, "daemon shutting down")
+		c.fail(websocket.StatusGoingAway, "daemon shutting down")
 	}
 }
 
 // ServeHTTP upgrades HTTP requests to WebSocket and handles them.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	deviceID := ""
-	authenticated := false
-	if credential != "" {
-		if d, ok := h.auth.ValidateCredential(credential); ok {
-			deviceID = d
-			authenticated = true
-		}
-	}
+	headerCred := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns: []string{"*"},
@@ -97,67 +125,139 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	if err := h.handleConnection(ctx, conn, deviceID, authenticated); err != nil {
-		h.log.Warn("connection closed", "device", deviceID, "error", err)
+	// Guarantee a close frame on every exit path, including pairing (which
+	// serves one frame and returns) and early auth failures.
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	if err := h.handleConnection(r.Context(), conn, headerCred, r.RemoteAddr, r.UserAgent()); err != nil {
+		h.log.Warn("connection closed", "error", err)
 	}
 }
 
-func (h *Hub) handleConnection(ctx context.Context, conn *websocket.Conn, deviceID string, authenticated bool) error {
-	typ, data, err := conn.Read(ctx)
+// handleConnection reads the hello frame, resolves authentication (header
+// beats hello; credential-in-hello exists because browsers cannot set an
+// Authorization header on a WebSocket), and dispatches to pairing or the
+// authenticated sync loop.
+func (h *Hub) handleConnection(ctx context.Context, conn *websocket.Conn, headerCred, remoteAddr, userAgent string) error {
+	hello, err := readHello(ctx, conn)
 	if err != nil {
 		return err
 	}
-	if typ != websocket.MessageText {
-		return errors.New("expected text message")
-	}
-	var hello protocol.Envelope
-	if err := json.Unmarshal(data, &hello); err != nil {
-		return err
-	}
-	if hello.Type != protocol.MsgHello || hello.Hello == nil {
-		return errors.New("expected hello envelope")
+
+	cred := headerCred
+	if cred == "" {
+		cred = hello.Credential
 	}
 
-	// Pairing flow: no device credential yet.
-	if !authenticated {
-		if hello.Hello.PairingToken == "" {
-			_ = h.sendError(ctx, conn, "", "auth_required", "authorization header or pairing token required")
-			return errors.New("auth required")
+	deviceID, authenticated := "", false
+	if cred != "" {
+		// ValidateCredential is called at most once per connection; it bumps
+		// last_seen as a side effect.
+		if d, ok := h.auth.ValidateCredential(cred); ok {
+			deviceID, authenticated = d, true
 		}
-		name, ok := h.auth.ConsumePairingToken(hello.Hello.PairingToken)
+	}
+	if !authenticated {
+		return h.handlePairing(ctx, conn, hello, remoteAddr, userAgent)
+	}
+	return h.serveAuthenticated(ctx, conn, deviceID, hello)
+}
+
+func readHello(ctx context.Context, conn *websocket.Conn) (*protocol.HelloPayload, error) {
+	typ, data, err := conn.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if typ != websocket.MessageText {
+		return nil, errors.New("expected text message")
+	}
+	var env protocol.Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, err
+	}
+	if env.Type != protocol.MsgHello || env.Hello == nil {
+		return nil, errors.New("expected hello envelope")
+	}
+	return env.Hello, nil
+}
+
+// handlePairing drives the connect-time pairing exchange. A token approved
+// out-of-band is consumed directly; otherwise the host Approver is consulted
+// and the token is approved and consumed on success.
+func (h *Hub) handlePairing(ctx context.Context, conn *websocket.Conn, hello *protocol.HelloPayload, remoteAddr, userAgent string) error {
+	token := hello.PairingToken
+	if token == "" {
+		_ = h.sendError(ctx, conn, "", "auth_required", "credential or pairing token required")
+		return errors.New("auth required")
+	}
+	if _, ok := h.auth.PeekPairingToken(token); !ok {
+		_ = h.sendError(ctx, conn, "", "pairing_denied", "pairing token invalid, expired, or already used")
+		return errors.New("pairing denied")
+	}
+
+	name := ""
+	if n, ok := h.auth.ConsumePairingToken(token); ok {
+		name = n
+	} else if h.cfg.Approver != nil {
+		n, ok := h.cfg.Approver.RequestApproval(ctx, ApprovalRequest{
+			Token:      token,
+			RemoteAddr: remoteAddr,
+			UserAgent:  userAgent,
+		})
 		if !ok {
-			_ = h.sendError(ctx, conn, "", "pairing_denied", "pairing token invalid, expired, or not approved")
+			_ = h.sendError(ctx, conn, "", "pairing_denied", "pairing not approved on host")
 			return errors.New("pairing denied")
 		}
-		newDeviceID, err := generateID()
-		if err != nil {
+		name = strings.TrimSpace(n)
+		if name == "" {
+			name = nameFromUserAgent(userAgent)
+		}
+		if err := h.auth.ApprovePairingToken(token, name); err != nil {
+			_ = h.sendError(ctx, conn, "", "pairing_denied", "pairing token invalid or expired")
 			return err
 		}
-		credential, err := h.auth.IssueCredential(newDeviceID, name)
-		if err != nil {
-			_ = h.sendError(ctx, conn, "", "server_error", err.Error())
-			return err
+		if n, ok := h.auth.ConsumePairingToken(token); ok {
+			name = n
 		}
-		resp := protocol.Envelope{
-			Version: protocol.Version,
-			Type:    protocol.MsgPaired,
-			Paired: &protocol.PairedPayload{
-				DeviceID:   newDeviceID,
-				Name:       name,
-				Credential: credential,
-			},
-		}
-		return h.writeEnvelope(ctx, conn, resp)
+	} else {
+		_ = h.sendError(ctx, conn, "", "pairing_denied", "pairing token not approved")
+		return errors.New("pairing denied")
 	}
 
-	// Authenticated client.
-	if hello.Hello.DeviceID == "" {
-		hello.Hello.DeviceID = deviceID
+	newDeviceID, err := generateID()
+	if err != nil {
+		return err
 	}
-	if hello.Hello.DeviceID != deviceID {
+	credential, err := h.auth.IssueCredential(newDeviceID, name)
+	if err != nil {
+		_ = h.sendError(ctx, conn, "", "server_error", err.Error())
+		return err
+	}
+	resp := protocol.Envelope{
+		Version: protocol.Version,
+		Type:    protocol.MsgPaired,
+		Paired: &protocol.PairedPayload{
+			DeviceID:   newDeviceID,
+			Name:       name,
+			Credential: credential,
+		},
+	}
+	h.log.Info("device paired", "device", newDeviceID, "name", name)
+	return h.writeEnvelope(ctx, conn, resp)
+}
+
+func (h *Hub) serveAuthenticated(ctx context.Context, conn *websocket.Conn, deviceID string, hello *protocol.HelloPayload) error {
+	if hello.DeviceID == "" {
+		hello.DeviceID = deviceID
+	}
+	if hello.DeviceID != deviceID {
 		_ = h.sendError(ctx, conn, "", "device_mismatch", "device id does not match credential")
 		return errors.New("device mismatch")
+	}
+
+	name := deviceID
+	if d, err := h.store.GetDevice(deviceID); err == nil && d != nil && d.Name != "" {
+		name = d.Name
 	}
 
 	snapshot, err := h.store.GetSnapshot(h.cfg.SessionID)
@@ -165,7 +265,7 @@ func (h *Hub) handleConnection(ctx context.Context, conn *websocket.Conn, device
 		_ = h.sendError(ctx, conn, "", "server_error", err.Error())
 		return err
 	}
-	events, err := h.store.GetEventsSince(h.cfg.SessionID, hello.Hello.LastSeq, 0)
+	events, err := h.store.GetEventsSince(h.cfg.SessionID, hello.LastSeq, 0)
 	if err != nil {
 		_ = h.sendError(ctx, conn, "", "server_error", err.Error())
 		return err
@@ -173,32 +273,32 @@ func (h *Hub) handleConnection(ctx context.Context, conn *websocket.Conn, device
 
 	c := &client{
 		deviceID: deviceID,
-		name:     deviceID,
+		name:     name,
 		conn:     conn,
-		send:     make(chan []byte, 256),
-		lastSeq:  hello.Hello.LastSeq,
+		send:     make(chan []byte, clientQueueHighWater),
+		overflow: make(chan struct{}, 1),
+		lastSeq:  hello.LastSeq,
+		log:      h.log,
 	}
-	go c.writeLoop(ctx, h.log)
+	go c.writeLoop(ctx)
 
 	defer func() {
 		h.mu.Lock()
 		delete(h.clients, c)
 		h.mu.Unlock()
-		// Do not close c.send here; the writeLoop owns it and broadcast uses
-		// non-blocking sends. Closing it would race with broadcast.
-		_ = conn.Close(websocket.StatusNormalClosure, "")
+		c.fail(websocket.StatusNormalClosure, "")
 	}()
 
 	h.mu.Lock()
 	h.clients[c] = struct{}{}
-	_ = h.writeToClient(c, protocol.Envelope{
+	_ = h.enqueue(c, protocol.Envelope{
 		Version:  protocol.Version,
 		Type:     protocol.MsgSnapshot,
-		Snapshot: snapshotToPayload(snapshot),
+		Snapshot: h.snapshotToPayload(snapshot),
 	})
 	for i := range events {
 		ev := events[i]
-		_ = h.writeToClient(c, protocol.Envelope{
+		_ = h.enqueue(c, protocol.Envelope{
 			Version: protocol.Version,
 			Type:    protocol.MsgEvent,
 			Event:   &ev,
@@ -227,7 +327,7 @@ func (h *Hub) handleConnection(ctx context.Context, conn *websocket.Conn, device
 
 func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.CommandPayload) {
 	if cmd.ID == "" {
-		_ = h.sendError(ctx, c.conn, "", "bad_request", "command id required")
+		_ = h.enqueue(c, h.errorEnvelope("", "bad_request", "command id required"))
 		return
 	}
 	if cmd.IdempotencyKey == "" {
@@ -243,7 +343,7 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 	}
 	h.mu.Unlock()
 	if seen {
-		_ = h.ack(ctx, c.conn, cmd.ID, 0)
+		_ = h.enqueue(c, h.ackEnvelope(cmd.ID, 0))
 		return
 	}
 
@@ -251,7 +351,7 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 	case protocol.CmdSendPrompt:
 		var body protocol.SendPromptBody
 		if err := json.Unmarshal(cmd.Payload, &body); err != nil {
-			_ = h.sendError(ctx, c.conn, cmd.ID, "bad_request", "invalid send_prompt payload")
+			h.clientError(c, cmd.ID, "bad_request", "invalid send_prompt payload")
 			return
 		}
 		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventUserPrompt, protocol.UserPromptBody{
@@ -259,20 +359,20 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 			ByDevice: c.deviceID,
 		})
 		if err != nil {
-			_ = h.clientError(c, cmd.ID, "server_error", err.Error())
+			h.clientError(c, cmd.ID, "server_error", err.Error())
 			return
 		}
-		_ = h.clientAck(c, cmd.ID, ev.Seq)
+		h.clientAck(c, cmd.ID, ev.Seq)
 		h.broadcast(ev)
 		if err := h.adapter.Command(agent.Command{Kind: protocol.CmdSendPrompt, Payload: body}); err != nil {
-			_ = h.clientError(c, cmd.ID, "agent_error", err.Error())
+			h.clientError(c, cmd.ID, "agent_error", err.Error())
 			return
 		}
 
 	case protocol.CmdAnswerPermission:
 		var body protocol.AnswerPermissionBody
 		if err := json.Unmarshal(cmd.Payload, &body); err != nil {
-			_ = h.clientError(c, cmd.ID, "bad_request", "invalid answer_permission payload")
+			h.clientError(c, cmd.ID, "bad_request", "invalid answer_permission payload")
 			return
 		}
 		h.mu.Lock()
@@ -282,7 +382,7 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 		}
 		h.mu.Unlock()
 		if !pending {
-			_ = h.clientError(c, cmd.ID, "already_resolved", "permission request already resolved or unknown")
+			h.clientError(c, cmd.ID, "already_resolved", "permission request already resolved or unknown")
 			return
 		}
 		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventPermissionResolved, protocol.PermissionResolvedBody{
@@ -291,20 +391,20 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 			ByDevice:  c.deviceID,
 		})
 		if err != nil {
-			_ = h.clientError(c, cmd.ID, "server_error", err.Error())
+			h.clientError(c, cmd.ID, "server_error", err.Error())
 			return
 		}
-		_ = h.clientAck(c, cmd.ID, ev.Seq)
+		h.clientAck(c, cmd.ID, ev.Seq)
 		h.broadcast(ev)
 		if err := h.adapter.Command(agent.Command{Kind: protocol.CmdAnswerPermission, Payload: body}); err != nil {
-			_ = h.clientError(c, cmd.ID, "agent_error", err.Error())
+			h.clientError(c, cmd.ID, "agent_error", err.Error())
 			return
 		}
 
 	case protocol.CmdAnswerQuestion:
 		var body protocol.AnswerQuestionBody
 		if err := json.Unmarshal(cmd.Payload, &body); err != nil {
-			_ = h.clientError(c, cmd.ID, "bad_request", "invalid answer_question payload")
+			h.clientError(c, cmd.ID, "bad_request", "invalid answer_question payload")
 			return
 		}
 		h.mu.Lock()
@@ -314,7 +414,7 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 		}
 		h.mu.Unlock()
 		if !pending {
-			_ = h.clientError(c, cmd.ID, "already_resolved", "question already resolved or unknown")
+			h.clientError(c, cmd.ID, "already_resolved", "question already resolved or unknown")
 			return
 		}
 		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventQuestionResolved, protocol.QuestionResolvedBody{
@@ -323,20 +423,20 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 			ByDevice:   c.deviceID,
 		})
 		if err != nil {
-			_ = h.clientError(c, cmd.ID, "server_error", err.Error())
+			h.clientError(c, cmd.ID, "server_error", err.Error())
 			return
 		}
-		_ = h.clientAck(c, cmd.ID, ev.Seq)
+		h.clientAck(c, cmd.ID, ev.Seq)
 		h.broadcast(ev)
 		if err := h.adapter.Command(agent.Command{Kind: protocol.CmdAnswerQuestion, Payload: body}); err != nil {
-			_ = h.clientError(c, cmd.ID, "agent_error", err.Error())
+			h.clientError(c, cmd.ID, "agent_error", err.Error())
 			return
 		}
 
 	case protocol.CmdSetMode:
 		var body protocol.SetModeBody
 		if err := json.Unmarshal(cmd.Payload, &body); err != nil || body.Mode == "" {
-			_ = h.clientError(c, cmd.ID, "bad_request", "invalid set_mode payload")
+			h.clientError(c, cmd.ID, "bad_request", "invalid set_mode payload")
 			return
 		}
 		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventModeChanged, protocol.ModeChangedBody{
@@ -344,31 +444,31 @@ func (h *Hub) handleCommand(ctx context.Context, c *client, cmd *protocol.Comman
 			ByDevice: c.deviceID,
 		})
 		if err != nil {
-			_ = h.clientError(c, cmd.ID, "server_error", err.Error())
+			h.clientError(c, cmd.ID, "server_error", err.Error())
 			return
 		}
-		_ = h.clientAck(c, cmd.ID, ev.Seq)
+		h.clientAck(c, cmd.ID, ev.Seq)
 		h.broadcast(ev)
 		if err := h.adapter.Command(agent.Command{Kind: protocol.CmdSetMode, Payload: body}); err != nil {
-			_ = h.clientError(c, cmd.ID, "agent_error", err.Error())
+			h.clientError(c, cmd.ID, "agent_error", err.Error())
 			return
 		}
 
 	case protocol.CmdInterrupt:
 		ev, err := h.store.AppendEvent(h.cfg.SessionID, protocol.EventStatusChange, protocol.StatusChangeBody{Status: "idle"})
 		if err != nil {
-			_ = h.clientError(c, cmd.ID, "server_error", err.Error())
+			h.clientError(c, cmd.ID, "server_error", err.Error())
 			return
 		}
-		_ = h.clientAck(c, cmd.ID, ev.Seq)
+		h.clientAck(c, cmd.ID, ev.Seq)
 		h.broadcast(ev)
 		if err := h.adapter.Command(agent.Command{Kind: protocol.CmdInterrupt, Payload: struct{}{}}); err != nil {
-			_ = h.clientError(c, cmd.ID, "agent_error", err.Error())
+			h.clientError(c, cmd.ID, "agent_error", err.Error())
 			return
 		}
 
 	default:
-		_ = h.clientError(c, cmd.ID, "unsupported_command", string(cmd.Kind))
+		h.clientError(c, cmd.ID, "unsupported_command", string(cmd.Kind))
 	}
 }
 
@@ -442,25 +542,33 @@ func (h *Hub) broadcast(ev *protocol.EventPayload) {
 	h.mu.RUnlock()
 
 	for _, c := range clients {
-		select {
-		case c.send <- data:
-		default:
-			h.log.Warn("client send buffer full; dropping event", "device", c.deviceID)
-		}
+		h.enqueueRaw(c, data)
 	}
 }
 
-func (h *Hub) writeToClient(c *client, env protocol.Envelope) bool {
+// enqueue marshals and routes a message through a client's outbound queue.
+func (h *Hub) enqueue(c *client, env protocol.Envelope) bool {
 	data, err := json.Marshal(env)
 	if err != nil {
 		h.log.Error("failed to marshal client message", "error", err)
 		return false
 	}
+	return h.enqueueRaw(c, data)
+}
+
+// enqueueRaw routes pre-marshalled bytes through a client's outbound queue. On
+// overflow the client is flagged so its writeLoop closes the connection with
+// StatusTryAgainLater, prompting a clean resync.
+func (h *Hub) enqueueRaw(c *client, data []byte) bool {
 	select {
 	case c.send <- data:
 		return true
 	default:
-		h.log.Warn("client send buffer full during catch-up", "device", c.deviceID)
+		h.log.Warn("client send queue full; closing for resync", "device", c.deviceID)
+		select {
+		case c.overflow <- struct{}{}:
+		default:
+		}
 		return false
 	}
 }
@@ -473,65 +581,64 @@ func (h *Hub) writeEnvelope(ctx context.Context, conn *websocket.Conn, env proto
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
-func (h *Hub) ack(ctx context.Context, conn *websocket.Conn, commandID string, seq int64) error {
-	return h.writeEnvelope(ctx, conn, protocol.Envelope{
+func (h *Hub) ackEnvelope(commandID string, seq int64) protocol.Envelope {
+	return protocol.Envelope{
 		Version: protocol.Version,
 		Type:    protocol.MsgAck,
 		Ack:     &protocol.AckPayload{CommandID: commandID, Seq: seq},
-	})
+	}
+}
+
+func (h *Hub) errorEnvelope(commandID, code, message string) protocol.Envelope {
+	return protocol.Envelope{
+		Version: protocol.Version,
+		Type:    protocol.MsgError,
+		Error: &protocol.ErrorPayload{
+			CommandID: commandID,
+			Code:      code,
+			Message:   message,
+		},
+	}
 }
 
 func (h *Hub) clientAck(c *client, commandID string, seq int64) bool {
-	return h.writeToClient(c, protocol.Envelope{
-		Version: protocol.Version,
-		Type:    protocol.MsgAck,
-		Ack:     &protocol.AckPayload{CommandID: commandID, Seq: seq},
-	})
+	return h.enqueue(c, h.ackEnvelope(commandID, seq))
 }
 
 func (h *Hub) sendError(ctx context.Context, conn *websocket.Conn, commandID, code, message string) error {
-	return h.writeEnvelope(ctx, conn, protocol.Envelope{
-		Version: protocol.Version,
-		Type:    protocol.MsgError,
-		Error: &protocol.ErrorPayload{
-			CommandID: commandID,
-			Code:      code,
-			Message:   message,
-		},
-	})
+	return h.writeEnvelope(ctx, conn, h.errorEnvelope(commandID, code, message))
 }
 
 func (h *Hub) clientError(c *client, commandID, code, message string) bool {
-	return h.writeToClient(c, protocol.Envelope{
-		Version: protocol.Version,
-		Type:    protocol.MsgError,
-		Error: &protocol.ErrorPayload{
-			CommandID: commandID,
-			Code:      code,
-			Message:   message,
-		},
-	})
+	return h.enqueue(c, h.errorEnvelope(commandID, code, message))
 }
 
-func (c *client) writeLoop(ctx context.Context, log logger.Logger) {
+func (c *client) writeLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case data, ok := <-c.send:
-			if !ok {
-				return
-			}
+		case <-c.overflow:
+			c.fail(websocket.StatusTryAgainLater, "outbound queue overflow")
+			return
+		case data := <-c.send:
 			if err := c.conn.Write(ctx, websocket.MessageText, data); err != nil {
-				log.Warn("client write failed", "device", c.deviceID, "error", err)
+				c.log.Warn("client write failed", "device", c.deviceID, "error", err)
 				return
 			}
 		}
 	}
 }
 
-func snapshotToPayload(s *store.Snapshot) *protocol.SnapshotPayload {
-	return &protocol.SnapshotPayload{
+// fail closes the connection exactly once.
+func (c *client) fail(code websocket.StatusCode, reason string) {
+	c.closeOnce.Do(func() {
+		_ = c.conn.Close(code, reason)
+	})
+}
+
+func (h *Hub) snapshotToPayload(s *store.Snapshot) *protocol.SnapshotPayload {
+	payload := &protocol.SnapshotPayload{
 		SessionID:          s.SessionID,
 		Status:             s.Status,
 		Mode:               s.Mode,
@@ -539,6 +646,43 @@ func snapshotToPayload(s *store.Snapshot) *protocol.SnapshotPayload {
 		PendingPermissions: s.PendingPermissions,
 		PendingQuestions:   s.PendingQuestions,
 	}
+	if devices, err := h.store.ListDevices(); err == nil {
+		views := make([]protocol.DeviceView, 0, len(devices))
+		for _, d := range devices {
+			if d.Revoked {
+				continue
+			}
+			views = append(views, protocol.DeviceView{DeviceID: d.DeviceID, Name: d.Name})
+		}
+		payload.Devices = views
+	}
+	return payload
+}
+
+func nameFromUserAgent(ua string) string {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return "device"
+	}
+	lower := strings.ToLower(ua)
+	switch {
+	case strings.Contains(lower, "android"):
+		return "Android"
+	case strings.Contains(lower, "iphone"), strings.Contains(lower, "ipad"):
+		return "iOS"
+	case strings.Contains(lower, "chrome"):
+		return "Chrome"
+	case strings.Contains(lower, "firefox"):
+		return "Firefox"
+	case strings.Contains(lower, "safari"):
+		return "Safari"
+	case strings.Contains(lower, "okhttp"), strings.Contains(lower, "react"):
+		return "Mobile"
+	}
+	if len(ua) > 32 {
+		return ua[:32]
+	}
+	return ua
 }
 
 func generateID() (string, error) {
@@ -551,5 +695,5 @@ func generateID() (string, error) {
 
 // CloseClient is a test helper that closes a client connection and waits for cleanup.
 func (h *Hub) CloseClient(c *client) {
-	_ = c.conn.Close(websocket.StatusNormalClosure, "")
+	c.fail(websocket.StatusNormalClosure, "")
 }

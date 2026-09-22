@@ -80,6 +80,17 @@ func (c *Config) EnsureDirs() error {
 	return nil
 }
 
+// SetDataDir overrides the data directory and recomputes derived paths
+// (cert/key) so flags like --data actually relocate the whole store.
+func (c *Config) SetDataDir(dir string) {
+	if dir != "" {
+		c.DataDir = dir
+	}
+	c.CertFile = ""
+	c.KeyFile = ""
+	c.applyDerivedPaths()
+}
+
 func (c *Config) applyDerivedPaths() {
 	if c.CertFile == "" {
 		c.CertFile = filepath.Join(c.DataDir, "cert.pem")

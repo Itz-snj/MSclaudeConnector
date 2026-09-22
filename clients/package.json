@@ -1,0 +1,29 @@
+{
+  "name": "@harness/clients",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Harness clients: shared protocol package, web UI, and Expo mobile app",
+  "workspaces": [
+    "packages/*",
+    "apps/web"
+  ],
+  "scripts": {
+    "protocol": "npm run build -w @harness/protocol",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "build": "npm run protocol && npm run build --workspaces --if-present",
+    "web-build": "node scripts/web-build.mjs",
+    "deps": "node scripts/check-deps.mjs",
+    "smoke": "node --experimental-websocket scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "8.15.0",
+    "@typescript-eslint/parser": "8.15.0",
+    "eslint": "8.57.1",
+    "eslint-plugin-react": "7.37.2",
+    "eslint-plugin-react-hooks": "5.0.0",
+    "typescript": "5.6.3",
+    "vitest": "2.1.5"
+  }
+}

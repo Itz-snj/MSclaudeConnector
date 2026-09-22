@@ -1,0 +1,13 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+apply plugin: 'expo-module-gradle-plugin'
+
+group = 'dev.harness.tls'
+version = '0.0.0'
+
+android {
+  namespace 'dev.harness.tls'
+  defaultConfig {
+    minSdkVersion 24
+  }
+}

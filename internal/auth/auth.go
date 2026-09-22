@@ -5,13 +5,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
+	"strings"
 	"time"
 
 	"github.com/Itz-snj/MSclaudeConnector/internal/store"
 )
 
-// TokenTTL is how long a one-time pairing token remains valid.
-const TokenTTL = 5 * time.Minute
+// TokenTTL is the default lifetime of a one-time pairing token. The QR stays
+// on screen, so the token must outlive a slow human; the real perimeter is the
+// console approval prompt at connect time.
+const TokenTTL = 30 * time.Minute
+
+// TTLForever marks a pairing token that never expires (--pair-ttl 0).
+const TTLForever time.Duration = 0
 
 // Auth manages pairing tokens and device credentials.
 type Auth struct {
@@ -22,17 +29,50 @@ func New(st *store.Store) *Auth {
 	return &Auth{store: st}
 }
 
-// GeneratePairingToken creates a new one-time pairing token.
+// GeneratePairingToken creates a new one-time pairing token with the default TTL.
 func (a *Auth) GeneratePairingToken() (string, error) {
+	return a.GeneratePairingTokenTTL(TokenTTL)
+}
+
+// GeneratePairingTokenTTL creates a new one-time pairing token. A ttl of zero
+// (TTLForever) creates a token that never expires.
+func (a *Auth) GeneratePairingTokenTTL(ttl time.Duration) (string, error) {
 	raw, err := randomBytes(32)
 	if err != nil {
 		return "", err
 	}
 	token := hex.EncodeToString(raw)
-	if err := a.store.CreatePendingToken(token, time.Now().Add(TokenTTL)); err != nil {
+	expires := time.Now().Add(ttl)
+	if ttl == TTLForever {
+		expires = time.Unix(0, math.MaxInt64)
+	}
+	if err := a.store.CreatePendingToken(token, expires); err != nil {
 		return "", err
 	}
 	return token, nil
+}
+
+// PeekPairingToken validates a token without consuming it. It returns the
+// pending token when it exists and has not expired. Used at connect time
+// before the user is asked to approve the pairing.
+func (a *Auth) PeekPairingToken(token string) (*store.PendingToken, bool) {
+	pt, err := a.store.GetPendingToken(token)
+	if err != nil || pt == nil {
+		return nil, false
+	}
+	if time.Now().After(pt.ExpiresAt) {
+		return nil, false
+	}
+	return pt, true
+}
+
+// ApprovalCode returns the 4-character code shown on both the host console and
+// the pairing client: the first 4 uppercase hex characters of the token.
+func ApprovalCode(token string) string {
+	if len(token) < 4 {
+		return strings.ToUpper(token)
+	}
+	return strings.ToUpper(token[:4])
 }
 
 // ApprovePairingToken marks a pending token as approved with a human-readable

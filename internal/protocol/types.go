@@ -39,6 +39,9 @@ type HelloPayload struct {
 	DeviceID     string `json:"deviceId"`
 	LastSeq      int64  `json:"lastSeq"`
 	PairingToken string `json:"pairingToken,omitempty"`
+	// Credential lets browsers authenticate in the hello body; browsers cannot
+	// set an Authorization header on a WebSocket handshake. Never logged.
+	Credential string `json:"credential,omitempty"`
 }
 
 type SnapshotPayload struct {
@@ -48,7 +51,15 @@ type SnapshotPayload struct {
 	LastSeq            int64            `json:"lastSeq"`
 	PendingPermissions []PermissionView `json:"pendingPermissions,omitempty"`
 	PendingQuestions   []QuestionView   `json:"pendingQuestions,omitempty"`
+	Devices            []DeviceView     `json:"devices,omitempty"`
 	RecentEvents       []EventPayload   `json:"recentEvents,omitempty"` // optional: last N for context
+}
+
+// DeviceView exposes a paired device's id and human-readable name so clients
+// can attribute actions instead of rendering raw 32-hex ids.
+type DeviceView struct {
+	DeviceID string `json:"deviceId"`
+	Name     string `json:"name"`
 }
 
 type PermissionView struct {

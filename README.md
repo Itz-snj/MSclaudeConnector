@@ -2,7 +2,7 @@
 
 **A multi-device harness for live coding-agent sessions.** Run Claude Code (later OpenAI Codex) on your Windows PC, walk away, and keep driving that *same live session* from another PC or your phone.
 
-> **Status:** Phase 1 host core implemented. Real Claude POC-1 gate runs when `ANTHROPIC_API_KEY` is set. See [PLAN.md](PLAN.md) for the roadmap.
+> **Status:** Phase 2 clients implemented — shared TS protocol package, embedded React web UI, and an Expo Android app. See [PLAN.md](PLAN.md) for the roadmap and [docs/PHASE2.md](docs/PHASE2.md) for what shipped.
 
 ---
 
@@ -44,6 +44,7 @@ flowchart LR
 | [PLAN.md](PLAN.md) | Locked decisions, tech stack, Phase 0–3 roadmap, POC gates, MVP scope, risks, backlog |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, state ownership, sync protocol, networking, security model, alternatives considered |
 | [docs/SYSTEM-DESIGN.md](docs/SYSTEM-DESIGN.md) | 8 Mermaid diagrams: system context, topology, pairing, prompt flow, permissions, resume, data model, adapters |
+| [docs/PHASE2.md](docs/PHASE2.md) | Phase 2: Go gap fixes, protocol package, web UI, Expo app, Android TLS pinning, build/CI |
 
 ## Tech Stack
 
@@ -92,25 +93,50 @@ MSclaudeConnector/
 │   ├── protocol/            ← versioned JSON message types
 │   ├── store/               ← SQLite event log + device registry
 │   ├── supervisor/          ← process supervisor (Windows Job Objects)
-│   └── webui/               ← embedded placeholder web UI
+│   └── webui/               ← embedded React web UI bundle
+├── clients/                 ← npm workspace (protocol + web; mobile standalone)
+│   ├── packages/harness-protocol/   ← @harness/protocol: types, client, reducer
+│   ├── apps/web/            ← @harness/web: React UI built into internal/webui/web
+│   └── apps/mobile/         ← @harness/mobile: Expo Android app + native TLS module
+├── Makefile · .nvmrc · .gitattributes · .github/workflows/ci.yml
 └── go.mod / go.sum
 ```
 
 ## Quick Start (development)
 
 ```bash
-# Build
+# Build (Go only — the web bundle is committed)
 go build -o harness ./cmd/harness
 
 # Run with the mock agent (no Claude binary needed)
 ./harness serve --agent mock --dir /path/to/project --bind 127.0.0.1
 
-# Pair a device
-./harness pair --generate              # on the host, prints a token
-./harness pair --approve <token>:phone # physically confirm
-
 # Run with real Claude (requires ANTHROPIC_API_KEY)
 ./harness serve --agent claude --dir /path/to/project
+
+# Plaintext mode for trusted/private networks (dev convenience)
+./harness serve --agent mock --insecure-http --bind 127.0.0.1
+
+# Re-print a pairing QR with a fresh token
+./harness pair --qr
 ```
 
-The daemon prints a QR code and JSON blob containing addresses, port, token, and certificate fingerprint. Clients connect to `wss://<host>:<port>/ws` with the pinned cert and present the token once.
+The daemon prints a QR code and JSON blob containing addresses, port, token, and
+the host's **SPKI** pin. Scanning the QR (phone) or opening
+`https://<host>:7432/` (PC B) starts pairing; the host console then shows a
+**4-character approval code** that must match the client's before you approve.
+Tokens live 30 minutes by default (`--pair-ttl`; `0` = never expires). If stdin
+is not a TTY, pair out-of-band with `./harness pair --approve <token>:<name>`.
+
+## Building the clients
+
+```bash
+make web-install     # npm ci in clients/
+make web-build       # build protocol + web into internal/webui/web
+make web-verify      # typecheck + lint + vitest
+make test            # protocol + web tests and go test ./... -race
+make smoke           # real daemon + mock agent + real @harness/protocol client
+```
+
+The Expo app lives in `clients/apps/mobile` and is installed separately; see
+[docs/PHASE2.md §2](docs/PHASE2.md).

@@ -12,12 +12,15 @@ type Broadcaster struct {
 	server *zeroconf.Server
 }
 
-// NewBroadcaster registers a _harness._tcp service.
-func NewBroadcaster(instance string, port int, fingerprint string) (*Broadcaster, error) {
+// NewBroadcaster registers a _harness._tcp service. It advertises the SPKI
+// pin (not the certificate) so clients can pin the host identity across
+// certificate regeneration.
+func NewBroadcaster(instance string, port int, spki string) (*Broadcaster, error) {
 	txt := []string{
 		"version=1",
 		"path=/ws",
-		fmt.Sprintf("fingerprint=%s", fingerprint),
+		"spkialg=sha256",
+		fmt.Sprintf("spki=%s", spki),
 	}
 	server, err := zeroconf.Register(instance, "_harness._tcp", "local.", port, txt, nil)
 	if err != nil {

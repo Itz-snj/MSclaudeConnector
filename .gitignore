@@ -20,3 +20,13 @@ Thumbs.db
 *.local.json
 /data/
 /config/
+
+# Clients (node)
+clients/node_modules/
+clients/**/node_modules/
+clients/packages/*/dist/
+clients/apps/mobile/.expo/
+clients/apps/mobile/android/
+clients/apps/mobile/ios/
+clients/apps/mobile/web-build/
+*.tsbuildinfo

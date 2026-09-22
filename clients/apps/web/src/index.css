@@ -1,0 +1,231 @@
+:root {
+  --bg: #0b1220;
+  --panel: #131c2e;
+  --panel-2: #1b2740;
+  --border: #26344f;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #38bdf8;
+  --green: #34d399;
+  --red: #f87171;
+  --amber: #fbbf24;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 0.45rem 0.8rem;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem;
+  width: 100%;
+}
+
+.plaintext {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0.75rem;
+  gap: 0.75rem;
+}
+
+.pair {
+  max-width: 480px;
+  margin: 10vh auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  background: var(--panel);
+  padding: 1.25rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.pair h1 {
+  margin: 0;
+  color: var(--accent);
+  font-size: 1.4rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.field label {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.6rem;
+  letter-spacing: 0.4rem;
+  color: var(--accent);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.6rem;
+}
+
+.header .spacer {
+  flex: 1;
+}
+
+.badge {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.badge.live {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.badge.reconnecting,
+.badge.syncing {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.badge.unauthorized,
+.badge.error {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.stream {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding-right: 0.25rem;
+}
+
+.item {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+}
+
+.item.prompt {
+  border-left: 3px solid var(--accent);
+}
+
+.item.notice.error {
+  border-left: 3px solid var(--red);
+}
+
+.item.resolved {
+  opacity: 0.55;
+}
+
+.item .meta {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-bottom: 0.3rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tool summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tool pre {
+  background: var(--panel-2);
+  padding: 0.5rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.4rem 0 0;
+}
+
+.card {
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  background: rgba(251, 191, 36, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.card .actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.composer {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+}
+
+.composer textarea {
+  resize: vertical;
+  min-height: 2.6rem;
+  max-height: 8rem;
+}
+
+.usage {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.error-text {
+  color: var(--red);
+  font-size: 0.85rem;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+}

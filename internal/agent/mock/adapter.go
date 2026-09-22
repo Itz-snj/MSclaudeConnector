@@ -90,7 +90,8 @@ func (a *Adapter) loop(ctx context.Context) {
 				if !ok {
 					continue
 				}
-				a.emit(protocol.EventPayload{Kind: protocol.EventUserPrompt, Payload: payload(protocol.UserPromptBody{Text: body.Text, ByDevice: "mock"})})
+				// The hub owns the user_prompt event; the adapter only streams
+				// the agent's reaction to it.
 				a.emit(protocol.EventPayload{Kind: protocol.EventStatusChange, Payload: payload(protocol.StatusChangeBody{Status: "running"})})
 				a.emit(protocol.EventPayload{Kind: protocol.EventTextDelta, Payload: payload(protocol.TextDeltaBody{Content: "Ack: " + body.Text + "\n"})})
 				switch body.Text {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,10 +14,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/mdp/qrterminal/v3"
 	"github.com/Itz-snj/MSclaudeConnector/internal/agent"
 	"github.com/Itz-snj/MSclaudeConnector/internal/agent/claude"
 	"github.com/Itz-snj/MSclaudeConnector/internal/agent/mock"
@@ -29,7 +30,10 @@ import (
 	"github.com/Itz-snj/MSclaudeConnector/internal/netutil"
 	"github.com/Itz-snj/MSclaudeConnector/internal/store"
 	"github.com/Itz-snj/MSclaudeConnector/internal/webui"
+	"github.com/mdp/qrterminal/v3"
 )
+
+const defaultPairTTL = 30 * time.Minute
 
 func main() {
 	log := logger.New()
@@ -79,11 +83,13 @@ func serveCmd(cfg *config.Config, log logger.Logger, args []string) {
 	dataDir := fs.String("data", cfg.DataDir, "Directory for SQLite DB, certs, and session data")
 	agentType := fs.String("agent", "claude", "Agent type: 'claude' or 'mock'")
 	workDir := fs.String("dir", ".", "Working directory for the agent session")
+	pairTTL := fs.Duration("pair-ttl", defaultPairTTL, "Pairing token lifetime (0 = never expires)")
+	insecureHTTP := fs.Bool("insecure-http", false, "Serve plaintext HTTP/WS (trusted/private bind only)")
 	_ = fs.Parse(args)
 
 	cfg.Port = *port
 	cfg.Bind = *bind
-	cfg.DataDir = *dataDir
+	cfg.SetDataDir(*dataDir)
 
 	if err := cfg.EnsureDirs(); err != nil {
 		log.Error("failed to create data directories", "error", err)
@@ -94,10 +100,18 @@ func serveCmd(cfg *config.Config, log logger.Logger, args []string) {
 		os.Exit(1)
 	}
 
-	cert, fingerprint, err := certutil.LoadOrGenerate(cfg.CertFile, cfg.KeyFile)
+	keyExisted := fileExists(cfg.KeyFile)
+	cert, pins, regenerated, err := certutil.LoadOrGenerate(cfg.CertFile, cfg.KeyFile, buildSANs())
 	if err != nil {
 		log.Error("failed to load/generate TLS certificate", "error", err)
 		os.Exit(1)
+	}
+	if regenerated {
+		if !keyExisted {
+			log.Error("host identity changed; all paired devices must re-pair", "spki", pins.SPKI)
+		} else {
+			log.Warn("TLS certificate regenerated for new SANs; SPKI pin unchanged", "spki", pins.SPKI)
+		}
 	}
 
 	st, err := store.Open(filepath.Join(cfg.DataDir, "harness.db"))
@@ -107,7 +121,7 @@ func serveCmd(cfg *config.Config, log logger.Logger, args []string) {
 	}
 
 	authz := auth.New(st)
-	pairingToken, err := authz.GeneratePairingToken()
+	pairingToken, err := authz.GeneratePairingTokenTTL(*pairTTL)
 	if err != nil {
 		log.Error("failed to generate pairing token", "error", err)
 		os.Exit(1)
@@ -149,30 +163,43 @@ func serveCmd(cfg *config.Config, log logger.Logger, args []string) {
 		os.Exit(1)
 	}
 
-	hubHandler := hub.New(hub.Config{SessionID: session.ID}, log, st, authz, adapter)
+	hubHandler := hub.New(hub.Config{SessionID: session.ID, Approver: installApprover(log)}, log, st, authz, adapter)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	go hubHandler.Run(ctx)
 
-	addrs, err := netutil.LANIPs()
+	addrs, err := advertisedAddrs(cfg.Bind)
 	if err != nil {
 		addrs = []string{"127.0.0.1"}
 	}
-	if cfg.Bind != "" && cfg.Bind != "lan" && cfg.Bind != "tailnet" {
-		addrs = append([]string{cfg.Bind}, addrs...)
+
+	scheme := "https"
+	wsScheme := "wss"
+	if *insecureHTTP {
+		if err := validateInsecureBind(addrs); err != nil {
+			log.Error("refusing to start", "error", err)
+			os.Exit(1)
+		}
+		scheme, wsScheme = "http", "ws"
+		log.Warn("SERVING PLAINTEXT HTTP/WS — any device on this network can observe traffic", "bind", addrs)
 	}
-	pairingInfo := struct {
-		Addrs       []string `json:"addrs"`
-		Port        int      `json:"port"`
-		Token       string   `json:"token"`
-		Fingerprint string   `json:"fingerprint"`
-	}{
-		Addrs:       addrs,
-		Port:        cfg.Port,
-		Token:       pairingToken,
-		Fingerprint: fingerprint,
+
+	pairingInfo := pairingInfo{
+		Addrs:  addrs,
+		Port:   cfg.Port,
+		Token:  pairingToken,
+		SPKI:   pins.SPKI,
+		Code:   auth.ApprovalCode(pairingToken),
+		Scheme: scheme,
+		WS:     wsScheme,
 	}
 	pairingInfoJSON, _ := json.Marshal(pairingInfo)
+
+	log.Info("harness daemon starting",
+		"addr", resolveAddr(cfg.Bind, cfg.Port),
+		"session", session.ID,
+		"spki", pins.SPKI,
+		"scheme", scheme)
 
 	webHandler, err := webui.Handler()
 	if err != nil {
@@ -183,14 +210,13 @@ func serveCmd(cfg *config.Config, log logger.Logger, args []string) {
 	mux.Handle("/ws", hubHandler)
 	mux.Handle("/", webHandler)
 
-	addr := resolveAddr(cfg.Bind, cfg.Port)
 	server := &http.Server{
-		Addr:      addr,
+		Addr:      resolveAddr(cfg.Bind, cfg.Port),
 		Handler:   mux,
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
 	}
 
-	broadcaster, err := discovery.NewBroadcaster("harness-"+session.ID[:8], cfg.Port, fingerprint)
+	broadcaster, err := discovery.NewBroadcaster("harness-"+session.ID[:8], cfg.Port, pins.SPKI)
 	if err != nil {
 		log.Warn("mDNS broadcast failed", "error", err)
 	}
@@ -199,17 +225,23 @@ func serveCmd(cfg *config.Config, log logger.Logger, args []string) {
 	}
 
 	go func() {
-		log.Info("harness daemon listening", "addr", addr, "session", session.ID, "fingerprint", fingerprint)
 		fmt.Println()
 		fmt.Println("Pair this device:")
 		fmt.Println("  Token:", pairingToken)
-		fmt.Println("  Fingerprint:", fingerprint)
+		fmt.Println("  Code: ", auth.ApprovalCode(pairingToken))
+		fmt.Println("  SPKI: ", pins.SPKI)
 		fmt.Println("  JSON:", string(pairingInfoJSON))
 		fmt.Println()
 		qrterminal.Generate(string(pairingInfoJSON), qrterminal.L, os.Stdout)
 		fmt.Println()
-		if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("server error", "error", err)
+		if *insecureHTTP {
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("server error", "error", err)
+			}
+		} else {
+			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("server error", "error", err)
+			}
 		}
 	}()
 
@@ -231,7 +263,11 @@ func pairCmd(cfg *config.Config, log logger.Logger, args []string) {
 	approve := fs.String("approve", "", "Approve pending token (format: token:name)")
 	revoke := fs.String("revoke", "", "Revoke a paired device's credential")
 	list := fs.Bool("list", false, "List paired devices")
+	qr := fs.Bool("qr", false, "Generate a token and print a pairing QR")
+	pairTTL := fs.Duration("pair-ttl", defaultPairTTL, "Pairing token lifetime (0 = never expires)")
+	dataDir := fs.String("data", cfg.DataDir, "Directory for SQLite DB, certs, and session data")
 	_ = fs.Parse(args)
+	cfg.SetDataDir(*dataDir)
 
 	if err := cfg.EnsureDirs(); err != nil {
 		log.Error("failed to create data directories", "error", err)
@@ -247,8 +283,34 @@ func pairCmd(cfg *config.Config, log logger.Logger, args []string) {
 	authz := auth.New(st)
 
 	switch {
+	case *qr:
+		_, pins, _, err := certutil.LoadOrGenerate(cfg.CertFile, cfg.KeyFile, buildSANs())
+		if err != nil {
+			log.Error("failed to load/generate TLS certificate", "error", err)
+			os.Exit(1)
+		}
+		token, err := authz.GeneratePairingTokenTTL(*pairTTL)
+		if err != nil {
+			log.Error("failed to generate token", "error", err)
+			os.Exit(1)
+		}
+		info := pairingInfo{
+			Addrs:  mustAdvertisedAddrs(cfg.Bind),
+			Port:   cfg.Port,
+			Token:  token,
+			SPKI:   pins.SPKI,
+			Code:   auth.ApprovalCode(token),
+			Scheme: "https",
+			WS:     "wss",
+		}
+		raw, _ := json.Marshal(info)
+		fmt.Println("Token:", token)
+		fmt.Println("Code: ", info.Code)
+		fmt.Println("JSON:", string(raw))
+		fmt.Println()
+		qrterminal.Generate(string(raw), qrterminal.L, os.Stdout)
 	case *generate:
-		token, err := authz.GeneratePairingToken()
+		token, err := authz.GeneratePairingTokenTTL(*pairTTL)
 		if err != nil {
 			log.Error("failed to generate token", "error", err)
 			os.Exit(1)
@@ -291,7 +353,9 @@ func pairCmd(cfg *config.Config, log logger.Logger, args []string) {
 
 func statusCmd(cfg *config.Config, log logger.Logger, args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	dataDir := fs.String("data", cfg.DataDir, "Directory for SQLite DB, certs, and session data")
 	_ = fs.Parse(args)
+	cfg.SetDataDir(*dataDir)
 
 	if err := cfg.EnsureDirs(); err != nil {
 		log.Error("failed to create data directories", "error", err)
@@ -331,10 +395,186 @@ func statusCmd(cfg *config.Config, log logger.Logger, args []string) {
 	}
 }
 
+// pairingInfo is the JSON payload encoded in the pairing QR.
+type pairingInfo struct {
+	Addrs  []string `json:"addrs"`
+	Port   int      `json:"port"`
+	Token  string   `json:"token"`
+	SPKI   string   `json:"spki"`
+	Code   string   `json:"code"`
+	Scheme string   `json:"scheme"`
+	WS     string   `json:"ws"`
+}
+
+// terminalApprover prompts the host operator to confirm an inbound pairing.
+type terminalApprover struct {
+	mu      sync.Mutex
+	lines   chan string
+	started bool
+}
+
+// installApprover returns a terminal approver, or nil when stdin is not a TTY.
+// Without a TTY the daemon only accepts tokens approved out-of-band via
+// `harness pair --approve`.
+func installApprover(log logger.Logger) hub.Approver {
+	fi, err := os.Stdin.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		log.Warn("stdin is not a terminal; device pairing requires `harness pair --approve`")
+		return nil
+	}
+	return &terminalApprover{}
+}
+
+func (a *terminalApprover) RequestApproval(ctx context.Context, req hub.ApprovalRequest) (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	lines := a.ensureReader()
+	code := auth.ApprovalCode(req.Token)
+	defaultName := nameFromUserAgent(req.UserAgent)
+
+	fmt.Println()
+	fmt.Println("=== Pairing request ===")
+	fmt.Printf("  From:  %s\n", req.RemoteAddr)
+	fmt.Printf("  Agent: %s\n", req.UserAgent)
+	fmt.Printf("  Code:  %s\n", code)
+	fmt.Printf("Approve? [y/N] (60s) name [%s]: ", defaultName)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	select {
+	case <-timeoutCtx.Done():
+		fmt.Println("\n(approval timed out)")
+		return "", false
+	case line, ok := <-lines:
+		if !ok {
+			return "", false
+		}
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			return "", false
+		}
+		answer := strings.ToLower(fields[0])
+		if answer != "y" && answer != "yes" {
+			return "", false
+		}
+		name := defaultName
+		if len(fields) > 1 {
+			name = strings.Join(fields[1:], " ")
+		}
+		return name, true
+	}
+}
+
+func (a *terminalApprover) ensureReader() chan string {
+	if !a.started {
+		a.started = true
+		a.lines = make(chan string, 4)
+		go func() {
+			sc := bufio.NewScanner(os.Stdin)
+			for sc.Scan() {
+				a.lines <- sc.Text()
+			}
+			close(a.lines)
+		}()
+	}
+	return a.lines
+}
+
+func buildSANs() certutil.SANs {
+	dns := []string{"localhost"}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		dns = append(dns, host, host+".local")
+	}
+	ips := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
+	if addrs, err := netutil.LANIPs(); err == nil {
+		for _, a := range addrs {
+			if ip := net.ParseIP(a); ip != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return certutil.SANs{DNSNames: dns, IPs: ips}
+}
+
+func advertisedAddrs(bind string) ([]string, error) {
+	addrs, err := netutil.LANIPs()
+	if err != nil {
+		return nil, err
+	}
+	if bind != "" && bind != "lan" && bind != "tailnet" {
+		addrs = append([]string{bind}, addrs...)
+	}
+	return addrs, nil
+}
+
+func mustAdvertisedAddrs(bind string) []string {
+	addrs, err := advertisedAddrs(bind)
+	if err != nil {
+		return []string{"127.0.0.1"}
+	}
+	return addrs
+}
+
+// validateInsecureBind refuses plaintext HTTP unless every advertised address
+// is loopback, RFC1918, or CGNAT (100.64.0.0/10).
+func validateInsecureBind(addrs []string) error {
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil {
+			return fmt.Errorf("cannot validate bind address %q", a)
+		}
+		if !isPrivateIP(ip) {
+			return fmt.Errorf("bind address %s is not loopback, RFC1918, or CGNAT", a)
+		}
+	}
+	return nil
+}
+
+func isPrivateIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+	}
+	return false
+}
+
+func nameFromUserAgent(ua string) string {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return "device"
+	}
+	lower := strings.ToLower(ua)
+	switch {
+	case strings.Contains(lower, "android"):
+		return "Android"
+	case strings.Contains(lower, "iphone"), strings.Contains(lower, "ipad"):
+		return "iOS"
+	case strings.Contains(lower, "chrome"):
+		return "Chrome"
+	case strings.Contains(lower, "firefox"):
+		return "Firefox"
+	case strings.Contains(lower, "safari"):
+		return "Safari"
+	}
+	if len(ua) > 32 {
+		return ua[:32]
+	}
+	return ua
+}
+
 func resolveAddr(bind string, port int) string {
 	host := ""
 	if bind != "" && bind != "lan" && bind != "tailnet" {
 		host = bind
 	}
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port))
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

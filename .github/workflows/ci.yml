@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: go (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Test (race)
+        run: go test ./... -race
+
+  ts:
+    name: ts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - name: Install
+        run: npm ci
+        working-directory: clients
+      - name: Build protocol
+        run: npm run protocol
+        working-directory: clients
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: clients
+      - name: Lint
+        run: npm run lint
+        working-directory: clients
+      - name: Test
+        run: npm run test
+        working-directory: clients
+      - name: Build web
+        run: npm run build -w @harness/web
+        working-directory: clients
+
+  freshness:
+    name: bundle freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - name: Install
+        run: npm ci
+        working-directory: clients
+      - name: Rebuild committed bundle
+        run: node scripts/web-build.mjs
+        working-directory: clients
+      - name: Diff
+        run: git diff --exit-code -- internal/webui/web
+
+  deps:
+    name: dependency allowlist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Check allowlist
+        run: node scripts/check-deps.mjs
+        working-directory: clients
